@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# github=https://github.com/flyto23/singbox-hy3
+# github=https://github.com/flyto23/singbox
 
 # bash fonts colors
 red='\e[31m'
@@ -70,7 +70,7 @@ is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=flyto23/singbox-hy3
+is_sh_repo=flyto23/singbox
 is_pkg="wget tar bash"
 # Alpine: gcompat provides glibc compatibility for prebuilt binaries
 [[ $cmd =~ apk ]] && is_pkg="$is_pkg gcompat jq"
@@ -136,7 +136,7 @@ show_help() {
     exit 0
 }
 
-# install dependent pkg (synchronous, no background processes for low-end machines)
+# install dependent pkg
 install_pkg() {
     cmd_not_found=
     for i in $*; do
@@ -146,20 +146,20 @@ install_pkg() {
         pkg=$(echo $cmd_not_found | sed 's/,/ /g')
         log_msg warn "安装依赖包 >${pkg}"
         if [[ $cmd =~ apk ]]; then
-            apk update >/dev/null 2>&1
-            apk add $pkg >/dev/null 2>&1
+            apk update &>/dev/null
+            apk add $pkg &>/dev/null
             pkg_ok=$?
         else
-            $cmd install -y $pkg >/dev/null 2>&1
+            $cmd install -y $pkg &>/dev/null
             pkg_ok=$?
             if [[ $pkg_ok != 0 ]]; then
-                [[ $cmd =~ yum ]] && yum install epel-release -y >/dev/null 2>&1
+                [[ $cmd =~ yum ]] && yum install epel-release -y &>/dev/null
                 if [[ $cmd =~ zypper ]]; then
-                    $cmd --non-interactive refresh >/dev/null 2>&1
+                    $cmd --non-interactive refresh &>/dev/null
                 else
-                    $cmd update -y >/dev/null 2>&1
+                    $cmd update -y &>/dev/null
                 fi
-                $cmd install -y $pkg >/dev/null 2>&1
+                $cmd install -y $pkg &>/dev/null
                 pkg_ok=$?
             fi
         fi
@@ -169,7 +169,7 @@ install_pkg() {
     fi
 }
 
-# download file (sequential mode for low-end NAT machines)
+# download file
 download() {
     case $1 in
     core)
@@ -207,7 +207,7 @@ get_ip() {
     [[ -z $ip ]] && export "$(_wget -6 -qO- https://one.one.one.one/cdn-cgi/trace | grep ip=)" &>/dev/null
 }
 
-# check status (synchronous, no background processes for low-end machines)
+# check background tasks status
 check_status() {
     # dependent pkg install fail
     [[ ! -f $is_pkg_ok ]] && {
@@ -237,11 +237,11 @@ check_status() {
     else
         [[ ! $is_fail ]] && {
             is_wget=1
-            # Sequential downloads for low-end NAT machines (avoid parallel connection overhead)
-            [[ ! $is_core_file ]] && download core
-            [[ ! $local_install ]] && download sh
-            [[ $jq_not_found ]] && download jq
+            [[ ! $is_core_file ]] && download core &
+            [[ ! $local_install ]] && download sh &
+            [[ $jq_not_found ]] && download jq &
             get_ip
+            wait
             check_status
         }
     fi
@@ -357,31 +357,31 @@ main() {
     # install dependent pkg
     if [[ $cmd =~ apk ]]; then
         # Alpine: force install full versions to replace BusyBox applets
-        apk update >/dev/null 2>&1
-        apk add $is_pkg >/dev/null 2>&1
+        apk update &>/dev/null
+        apk add $is_pkg &>/dev/null
         [[ $? == 0 ]] && >$is_pkg_ok
     else
-        install_pkg $is_pkg
+        install_pkg $is_pkg &
     fi
 
-    # jq - check and download synchronously (avoid parallel issues on low-end machines)
+    # jq
     if [[ $(type -P jq) ]]; then
         >$is_jq_ok
     else
         jq_not_found=1
-        download jq
     fi
-    
-    # download core, sh sequentially for low-end NAT machines
+    # if wget installed. download core, sh, jq, get ip
     [[ $is_wget ]] && {
-        [[ ! $is_core_file ]] && download core
-        [[ ! $local_install ]] && download sh
+        [[ ! $is_core_file ]] && download core &
+        [[ ! $local_install ]] && download sh &
+        [[ $jq_not_found ]] && download jq &
+        get_ip
     }
 
-    # get server ip (only after downloads complete)
-    get_ip
+    # waiting for background tasks is done
+    wait
 
-    # check download status (sequential mode, no background tasks)
+    # check background tasks status
     check_status
 
     # test $is_core_file
