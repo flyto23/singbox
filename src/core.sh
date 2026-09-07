@@ -1075,10 +1075,9 @@ del() {
 
 # uninstall
 uninstall() {
+    # 装有 Caddy 时给出子菜单, 回车默认选第 1 项 (仅卸载 sing-box), 不再二次询问
     if [[ $is_caddy ]]; then
-        ask_menu is_do_uninstall uninstall_pick "" "" "" "卸载 $is_core_name" "卸载 ${is_core_name} & Caddy"
-    else
-        confirm "是否卸载 ${is_core_name}? [y]:"
+        ask_menu is_do_uninstall uninstall_pick "" "" "卸载 $is_core_name" "卸载 $is_core_name" "卸载 ${is_core_name} & Caddy"
     fi
     manage stop &>/dev/null
     manage disable &>/dev/null
@@ -1664,9 +1663,16 @@ get() {
         _green "安装 Caddy 成功.\n"
         ;;
     reinstall)
-        is_install_sh=$(cat $is_sh_dir/install.sh)
+        # 完全卸载后, 从 GitHub 仓库拉取最新安装脚本执行重装
+        is_install_sh=1 # 标记: uninstall 在重装流程中跳过“卸载完成!”提示 (见 uninstall)
         uninstall
-        bash <<<$is_install_sh
+        _yellow "\n卸载完成, 开始从 GitHub 仓库拉取最新安装脚本进行重装 ...\n"
+        is_reinstall_sh=${TMPDIR:-/tmp}/$is_core-install.sh-$$
+        if _wget -qO "$is_reinstall_sh" "https://raw.githubusercontent.com/${is_sh_repo}/main/install.sh" && [[ -s $is_reinstall_sh ]]; then
+            exec bash "$is_reinstall_sh" # exec: 用新安装进程接管当前进程, 装完直接退出, 不再回到旧菜单
+        fi
+        rm -f "$is_reinstall_sh"
+        err "从 GitHub 仓库拉取安装脚本失败, 请检查网络后重试."
         ;;
     test-run)
         if [[ $is_systemd ]]; then
