@@ -17,5 +17,5 @@
 
 # 一键安装
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/flyto23/singbox-hy3/main/install.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/flyto23/singbox/main/install.sh)
 ```
