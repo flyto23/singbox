@@ -181,6 +181,11 @@ get_ip() {
 : "${LOG_PATH:=/var/log/$is_core/access.log}"
 : "${IP_API:=https://one.one.one.one/cdn-cgi/trace}"
 : "${DNS_API:=https://one.one.one.one/dns-query}"
+# 仓库常量默认值: 独立运行 (sb) 时 install.sh/init.sh 不在场, 需自带默认; 与 install.sh / src/init.sh 保持一致
+# (is_sh_repo 已从 init.sh 的 $author/$is_core=233boy/sing-box 修正为 fork 仓库 flyto23/singbox), 可被 script.conf 覆盖
+: "${is_sh_repo:=flyto23/singbox}"
+: "${is_core_repo:=SagerNet/$is_core}"
+: "${is_caddy_repo:=caddyserver/caddy}"
 
 # 派生表与随机默认值（在 script.conf 之后构建, 覆盖 ss_method_list/servername_list 即可生效）
 # 同上: -g 保证在 load() 函数内 source 时仍是全局
@@ -1662,11 +1667,13 @@ get() {
         ;;
     reinstall)
         # 完全卸载后, 从 GitHub 仓库拉取最新安装脚本执行重装
+        # 仓库地址写死为 flyto23/singbox 的 main 分支 (与上方 is_sh_repo 默认值一致),
+        # 避免重装拿到的 install.sh 与当前脚本分叉; 若更换发行仓库需同步修改此处与 install.sh
         is_install_sh=1 # 标记: uninstall 在重装流程中跳过“卸载完成!”提示 (见 uninstall)
         uninstall
         _yellow "\n卸载完成, 开始从 GitHub 仓库拉取最新安装脚本进行重装 ...\n"
         is_reinstall_sh=${TMPDIR:-/tmp}/$is_core-install.sh-$$
-        if _wget -qO "$is_reinstall_sh" "https://raw.githubusercontent.com/${is_sh_repo}/main/install.sh" && [[ -s $is_reinstall_sh ]]; then
+        if _wget -qO "$is_reinstall_sh" "https://raw.githubusercontent.com/flyto23/singbox/main/install.sh" && [[ -s $is_reinstall_sh ]]; then
             exec bash "$is_reinstall_sh" # exec: 用新安装进程接管当前进程, 装完直接退出, 不再回到旧菜单
         fi
         rm -f "$is_reinstall_sh"
