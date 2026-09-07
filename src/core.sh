@@ -107,13 +107,37 @@ msg_ul() {
     echo -e "\e[4m$@\e[0m"
 }
 
-# 按固定列宽打印 "标签=值" 信息行 (代替 info_list + 数字索引 + tab 宽度 hack)
+# 计算字符串的终端显示宽度 (中文/全角按 2 列, ASCII 按 1 列)
+# 纯 bash 内置实现: C locale 下逐字节遍历, UTF-8 首字节(>=0xC0)计 2 列,
+# ASCII 计 1 列, 连续字节(0x80-0xBF)不再重复计; 不依赖 wc -L, 兼容 BusyBox
+_disp_width() {
+    local s=$1 i b w=0 LC_ALL=C
+    for ((i = 0; i < ${#s}; i++)); do
+        printf -v b '%d' "'${s:i:1}"
+        ((b &= 255)) # C locale 下高字节可能返回负值, 归一化到 0-255
+        if ((b >= 192)); then
+            ((w += 2))
+        elif ((b < 128)); then
+            ((w += 1))
+        fi
+    done
+    printf '%s' "$w"
+}
+
+# 按终端显示宽度对齐打印 "标签=值" 信息行, 保证所有 "=" 在同一列 (中文标签不错位)
+# 代替 info_list + 数字索引 + tab 宽度 hack
 show_info() {
-    local kv label val
+    local kv label val w max_w=16
+    # 先求最长标签宽度, 不足 16 列时按 16 列排版
+    for kv in "$@"; do
+        w=$(_disp_width "${kv%%=*}")
+        ((w > max_w)) && max_w=$w
+    done
     for kv in "$@"; do
         label=${kv%%=*}
         val=${kv#*=}
-        printf "%-24s= \e[${is_color}m%s\e[0m\n" "$label" "$val"
+        w=$(_disp_width "$label")
+        printf '%s%*s= \e['"$is_color"'m%s\e[0m\n' "$label" $((max_w - w)) '' "$val"
     done
 }
 
@@ -401,18 +425,17 @@ is_test() {
 is_port_used() {
     local port=$1
     if [[ -z $is_used_port ]]; then
-        # Optimized for low-end NAT machines: use lightweight commands first
         if type -P ss &>/dev/null; then
-            # Use -H (no header) and awk for faster port extraction
-            is_used_port="$(ss -tlnH 2>/dev/null | awk -F: '{print $NF}' | sort -nu; ss -ulnH 2>/dev/null | awk -F: '{print $NF}' | sort -nu)"
+            is_used_port="$(ss -tlnpH 2>/dev/null; ss -ulnH 2>/dev/null)"
         elif type -P netstat &>/dev/null; then
-            is_used_port="$(netstat -tln 2>/dev/null | awk -F: '{print $NF}' | sort -nu; netstat -uln 2>/dev/null | awk -F: '{print $NF}' | sort -nu)"
+            is_used_port="$(netstat -tnlp 2>/dev/null; netstat -unlp 2>/dev/null)"
         else
             is_cant_test_port=1
             msg "$is_warn 无法检测端口是否可用."
-            msg "请执行：$(_yellow "${cmd} update -y; ${cmd} install net-tools -y") 来修复此问题."
+            msg "请执行: $(_yellow "${cmd} update -y; ${cmd} install net-tools -y") 来修复此问题."
             return 1
         fi
+        is_used_port="$(sed -n 's/.*:\([0-9]\+\).*/\1/p' <<<"$is_used_port" | sort -nu)"
     fi
     grep -qx "$port" <<<"$is_used_port"
 }
