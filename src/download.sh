@@ -15,7 +15,8 @@ get_latest_version() {
     esac
     latest_ver=$(_wget -qO- $url | grep tag_name | grep -E -o 'v([0-9.]+)')
     [[ ! $latest_ver ]] && {
-        err "获取 ${name} 最新版本失败."
+        # 把接口地址打出来, 便于区分"仓库名写错/404"和"网络不通/API 限流"
+        err "获取 ${name} 最新版本失败.\n接口: $url"
     }
     unset name url
 }

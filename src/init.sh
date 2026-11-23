@@ -83,10 +83,10 @@ is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-# 本脚本是 fork: 更新/重装脚本必须指向 flyto23/singbox;
+# 本脚本是 fork: 更新/重装脚本必须指向 flyto23/singbox (仓库名没有连字符, 不能写成 $is_core);
 # 这里若沿用 $author/$is_core (233boy/sing-box), "更新脚本" 会把本脚本替换成上游原版,
 # 而原版不认本脚本的 direct_<port>/route 写法, 会让已建好的 reality 节点全部失效.
-is_sh_repo=flyto23/$is_core
+is_sh_repo=flyto23/singbox
 is_pkg="wget unzip tar qrencode bash"
 is_config_json=$is_core_dir/config.json
 is_caddy_bin=/usr/local/bin/caddy
