@@ -262,8 +262,12 @@ validate_ip() {
         return 0
     fi
     # IPv6 (loose: at least one colon, only hex digits and colons)
-    [[ $ip == *:* && $ip =~ ^[0-9A-Fa-f:]+$ ]] && return 0
-    return 1
+    [[ $ip == *:* && $ip =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    # 合法 IPv6 不允许出现 3 个及以上连续冒号 (:::), 且 :: 最多只能出现一次
+    [[ $ip == *:::* ]] && return 1
+    local rest=${ip#*::}
+    [[ $rest == *::* ]] && return 1
+    return 0
 }
 
 # 端口是否已被任意已有配置(conf/*.json)占用.
@@ -397,9 +401,10 @@ load_config_vars() {
         p("host";           $i.transport.headers.host),
         p("is_servername";  $i.tls.server_name),
         p("is_private_key"; $i.tls.reality.private_key),
-        p("is_public_key";  .outbounds[1].tag),
-        p("is_listen_disp"; ([.outbounds[].tag | select(startswith("nat_in_"))][0] | .[7:])),
-        p("is_bind_disp";   ([.outbounds[].tag | select(startswith("nat_out_"))][0] | .[8:])),
+        # 公钥存在假 outbound 的 tag 里: 新格式 public_key_<port>:<key>, 旧格式 public_key_<key>
+        p("is_public_key";  (([.outbounds[].tag | select(startswith("public_key_"))][0] // "") | sub("^public_key_[0-9]+:"; "") | sub("^public_key_"; ""))),
+        p("is_listen_disp"; (([.outbounds[].tag | select(startswith("nat_in_"))][0] // "") | .[7:] | sub("^[0-9]+_"; ""))),
+        p("is_bind_disp";   (([.outbounds[].tag | select(startswith("nat_out_"))][0] // "") | .[8:] | sub("^[0-9]+_"; ""))),
         p("is_bind4";       .outbounds[0].inet4_bind_address),
         p("is_bind6";       .outbounds[0].inet6_bind_address)
     ' "$f" 2>/dev/null) || err "无法读取此文件: $1"
@@ -542,7 +547,8 @@ ask_value() {
     local var=$1 prompt=$2 def=$3 check=$4 input
     while :; do
         echo -ne "$prompt"
-        read -r input
+        # 读不到输入(EOF)时直接退出, 否则会无限刷提示
+        read -r input || exit 1
         [[ -z $input && $def ]] && input=$def
         [[ -z $input ]] && continue
         if [[ ! $check ]] || "$check" "$input"; then
@@ -566,7 +572,8 @@ ask_menu() {
     [[ ! $prompt ]] && prompt="请选择 [\e[91m1-${#opts[@]}\e[0m]:"
     while :; do
         echo -ne "$prompt"
-        read -r pick
+        # 读不到输入(EOF, 例如 stdin 被关闭/非交互调用)直接退出, 否则会无限刷提示
+        read -r pick || exit 1
         if [[ -z $pick ]]; then
             if [[ $def == exit ]]; then
                 exit
@@ -597,7 +604,7 @@ confirm() {
     local r
     while :; do
         echo -ne "$1"
-        read -r r
+        read -r r || exit 1 # EOF 时退出, 避免死循环
         [[ $r =~ ^[Yy]$ ]] && return 0
         msg "请输入 (y)"
     done
@@ -653,7 +660,9 @@ ipv6_compress() {
         for ((i = 0; i < best_s; i++)); do left+=("${G[i]}"); done
         for ((i = best_s + best_l; i < 8; i++)); do right+=("${G[i]}"); done
         out=
-        ((${#left[@]})) && { out=$(IFS=:; echo "${left[*]}"); out+=:; }
+        # RFC5952: 「左边各组 + :: + 右边各组」, 不能再额外补冒号,
+        # 否则会出现 a:b:::c 这种非法地址 (旧实现会生成 fd91:cafe:cafe:10:::d)
+        ((${#left[@]})) && out=$(IFS=:; echo "${left[*]}")
         out+=::
         if ((${#right[@]})); then
             rs=$(IFS=:; echo "${right[*]}")
@@ -771,7 +780,11 @@ select_local_ip() {
     done
     while :; do
         echo -ne "请选择序号 [1-${#is_ip_opt[@]}], 回车选择第一项(${is_ip_tag[0]} ${is_ip_opt[0]}):"
-        read -r pick
+        # EOF 时返回空值并结束选择, 避免死循环
+        read -r pick || {
+            printf -v "$var" ''
+            return 1
+        }
         [[ -z $pick ]] && pick=1
         if [[ $pick =~ ^[0-9]+$ ]] && (( 10#$pick >= 1 && 10#$pick <= ${#is_ip_opt[@]} )); then
             idx=$((10#$pick - 1))
@@ -805,14 +818,20 @@ create() {
         [[ $is_change || ! $json_str ]] && get protocol $2
         [[ $net == "reality" ]] && {
             set_bind_json
-            # 约定：reality 公钥藏入一个假 outbound 的 tag（public_key_<key>），
-            # 读回逻辑见 load_config_vars（is_public_key=${is_public_key/public_key_/}），
+            # 约定：reality 公钥藏入一个假 outbound 的 tag（public_key_<port>:<key>），
+            # 读回逻辑见 load_config_vars（按前缀取 tag 后再剥掉 "public_key_<port>:"）。
+            # 用 ":" 作分隔符: base64url 密钥里不会出现冒号, 新旧格式可无歧义区分, 也与旧版
+            # public_key_<key> 兼容; 带上端口是为了让 tag 按节点唯一 (同一对密钥复用到多个节点时不会重名)。
             # 并依赖 build_route_json 的 ^direct_[0-9]+$ 过滤不误伤该 outbound。
             # NAT 适配: 公网(NAT)IP 非本机绑定地址, 不作为实际 listen/bind 的取值(实际用本机地址/不绑定),
             # 仅作为展示/链接地址, 经 nat_in_/nat_out_ tag 持久化, 由 load_config_vars 读回 (见 change 分支 13).
-            is_add_public_key=",outbounds:[{tag:\"direct_$port\",type:\"direct\"${is_bind_json_addr}},{tag:\"public_key_$is_public_key\",type:\"direct\"}"
-            [[ $is_listen_disp ]] && is_add_public_key+=",{tag:\"nat_in_$is_listen_disp\",type:\"direct\"}"
-            [[ $is_bind_disp ]] && is_add_public_key+=",{tag:\"nat_out_$is_bind_disp\",type:\"direct\"}"
+            # 注意: 这些假 outbound 的 tag 必须是「按节点唯一」的. 同一台 NAT 机器上, 多个节点的进口/出口 IP
+            # 往往就是同一个公网 IP; 若沿用 nat_in_<ip> / nat_out_<ip>, 两个配置会产生同名 outbound 标签,
+            # sing-box 合并后直接 FATAL (duplicate outbound/endpoint tag), 所有节点一起起不来.
+            # 所以把端口嵌进 tag: nat_in_<port>_<ip> / nat_out_<port>_<ip> (读回时剥掉端口前缀, 兼容旧格式).
+            is_add_public_key=",outbounds:[{tag:\"direct_$port\",type:\"direct\"${is_bind_json_addr}},{tag:\"public_key_${port}:$is_public_key\",type:\"direct\"}"
+            [[ $is_listen_disp ]] && is_add_public_key+=",{tag:\"nat_in_${port}_$is_listen_disp\",type:\"direct\"}"
+            [[ $is_bind_disp ]] && is_add_public_key+=",{tag:\"nat_out_${port}_$is_bind_disp\",type:\"direct\"}"
             is_add_public_key+="]"
         } || is_add_public_key=
         # 用户可控值一律走 --arg 注入, 片段内只允许出现 $var 引用, 杜绝转义/注入问题
@@ -1590,8 +1609,8 @@ get() {
             if [[ $is_private_key ]] || jq -e '.inbounds[0].tls.reality.enabled == true' <<<"$is_json_str" &>/dev/null; then
                 is_reality=1
                 net_type+=reality
-                # 从假 outbound tag 中抠回 reality 公钥（见 create 时的约定）
-                is_public_key=${is_public_key/public_key_/}
+                # 公钥已在 load_config_vars 里从假 outbound tag 解析好
+                # (兼容 public_key_<port>:<key> 与旧格式 public_key_<key>)
             fi
             is_socks_user=$username
             is_socks_pass=$password
