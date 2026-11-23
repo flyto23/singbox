@@ -34,7 +34,14 @@ download() {
         tmpfile=$tmpdir/$is_core.tar.gz
         link="https://github.com/${is_core_repo}/releases/download/${latest_ver}/${is_core}-${latest_ver:1}-linux-${is_arch}.tar.gz"
         download_file
-        tar zxf $tmpfile --strip-components 1 -C $is_core_dir/bin
+        # 覆盖正在运行的二进制会报 "Text file busy" 导致解压失败, 而脚本仍会提示更新成功;
+        # 先停服务再解压, 失败则把服务恢复回去并报错.
+        manage stop &>/dev/null
+        if ! tar zxf $tmpfile --strip-components 1 -C $is_core_dir/bin; then
+            manage start &>/dev/null
+            rm -rf $tmpdir
+            err "\n解压 ${name} 失败, 已恢复服务 (版本未变)."
+        fi
         chmod +x $is_core_bin
         ;;
     sh)

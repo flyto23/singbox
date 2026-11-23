@@ -204,9 +204,18 @@ get_port() {
         fi
         tmp_port=$(shuf -i ${PORT_MIN}-${PORT_MAX} -n 1)
         is_test port_used "$tmp_port" && continue
+        port_in_configs "$tmp_port" && continue
         [[ $tmp_port == $port ]] && continue
         break
     done
+}
+
+# Reality 密钥形态校验: sing-box 输出的是 32 字节 base64/base64url, 长度 43~44 (可能带 = 填充).
+# 解析/生成异常时(旧版 sed 解析、核心升级后输出变化等)会得到 "PrivateKey"/"Error" 之类垃圾值,
+# 必须拦住, 否则会写出无效节点, 合并配置非法 -> 核心起不来 -> 所有节点一起失效.
+_is_reality_key() {
+    local k=$1
+    [[ ${#k} -ge 40 && ${#k} -le 48 && $k =~ ^[A-Za-z0-9_+/-]+=*$ ]]
 }
 
 get_pbk() {
@@ -215,16 +224,18 @@ get_pbk() {
     is_private_key=
     for ((try = 0; try < 3; try++)); do
         raw=$($is_core_bin generate reality-keypair 2>&1)
-        is_tmp_pbk=($(sed 's/.*://' <<<"$raw"))
-        [[ ${#is_tmp_pbk[@]} -ge 2 ]] && {
+        # 只从第一处冒号截断: 用 .*: 会把带冒号的行截成空串, 用 ^[^:]*: 更稳
+        is_tmp_pbk=($(sed 's/^[^:]*://' <<<"$raw"))
+        if [[ ${#is_tmp_pbk[@]} -ge 2 ]] && _is_reality_key "${is_tmp_pbk[0]}" && _is_reality_key "${is_tmp_pbk[1]}"; then
             is_private_key=${is_tmp_pbk[0]}
             is_public_key=${is_tmp_pbk[1]}
             return 0
-        }
+        fi
     done
     # 3 次均失败: 打印 sing-box 输出, 便于定位 (避免再生成空密钥的节点)
     _yellow "\n警告: 获取 Reality 密钥失败 (已尝试 3 次). sing-box 输出如下:"
     msg "$raw"
+    return 1
 }
 
 # build the json fragment to bind the outbound to a specified IP (IPv4/IPv6)
@@ -255,6 +266,23 @@ validate_ip() {
     return 1
 }
 
+# 端口是否已被任意已有配置(conf/*.json)占用.
+# 只查实时监听是不够的: 核心未运行/正在重启(例如刚更新完核心)时, 已有节点的端口并不会出现在
+# ss/netstat 里; 这时若再建一个同端口的节点, 两个配置文件会生成同名 outbound 标签 direct_<port>,
+# 合并后的配置直接非法 (duplicate outbound/endpoint tag), 核心起不来 -> 所有节点一起失效.
+# $2 = 需要跳过的配置文件名 (修改端口时跳过当前配置自身)
+port_in_configs() {
+    local p=$1 skip=${2:-} f
+    [[ ! -d $is_conf_dir ]] && return 1
+    for f in "$is_conf_dir"/*.json; do
+        [[ -f $f ]] || continue
+        [[ $f == *route.json ]] && continue
+        [[ $skip && ${f##*/} == "$skip" ]] && continue
+        [[ $(jq -r '.inbounds[0].listen_port // empty' "$f" 2>/dev/null) == "$p" ]] && return 0
+    done
+    return 1
+}
+
 # unified input validators; on failure set VALIDATE_ERR and return 1
 validate_port() {
     local p=$1 mode=${2:-ask}
@@ -262,6 +290,7 @@ validate_port() {
     [[ $mode == door ]] && return 0
     [[ $mode == change ]] && { [[ $p == 443 || $p == "$port" ]] && return 0; }
     is_test port_used "$p" && { VALIDATE_ERR="无法使用 ($p) 端口."; return 1; }
+    port_in_configs "$p" "$is_config_file" && { VALIDATE_ERR="端口 ($p) 已被其他配置文件占用, 请更换端口."; return 1; }
     return 0
 }
 validate_uuid() {
@@ -394,19 +423,79 @@ build_route_json() {
     is_route_rules=
     for f in "$is_conf_dir"/*.json; do
         [[ -f "$f" ]] || continue
-        [[ "$f" == *route.json ]] && continue
-        is_in_tag=$(jq -r '.inbounds[0].tag' "$f" 2>/dev/null)
-        is_out_tag=$(jq -r '.outbounds[]?.tag | select(test("^direct_[0-9]+$"))' "$f" 2>/dev/null | head -1)
+        # 旧版本把 route 写在 conf/route.json 里; 该文件会被 -C 一起合并, 规则会重复/残留,
+        # 必须直接清掉 (只跳过不删除的话, 升级后的旧文件会一直参与合并).
+        [[ "$f" == *route.json ]] && {
+            rm -f "$f"
+            continue
+        }
+        is_in_tag=$(jq -r '.inbounds[0].tag // empty' "$f" 2>/dev/null)
+        is_out_tag=$(jq -r '[.outbounds[]?.tag | select(test("^direct_[0-9]+$"))][0] // empty' "$f" 2>/dev/null)
         [[ $is_in_tag && $is_out_tag ]] && {
             is_route_rules="$is_route_rules,{\"inbound\":[\"$is_in_tag\"],\"outbound\":\"$is_out_tag\"}"
         }
     done
     if [[ $is_route_rules ]]; then
-        is_route_json=$(jq -n "{rules:[${is_route_rules#,}],final:\"direct\"}")
+        is_route_json=$(jq -n "{rules:[${is_route_rules#,}],final:\"direct\"}" 2>/dev/null)
+        # jq 失败时退化为空规则, 避免写出半截 JSON 把主配置弄坏
+        [[ $is_route_json ]] || is_route_json='{"rules":[],"final":"direct"}'
         jq --argjson r "$is_route_json" '.route = $r' "$is_config_json" >"$is_config_json.tmp" && mv "$is_config_json.tmp" "$is_config_json"
     else
         jq 'del(.route)' "$is_config_json" >"$is_config_json.tmp" && mv "$is_config_json.tmp" "$is_config_json"
     fi
+}
+
+# 用 sing-box check 校验「主配置 + conf 目录」的合并结果 (与服务实际启动参数一致).
+# 校验失败时原样打印 sing-box 的报错, 便于直接定位; 返回 1.
+check_core_config() {
+    [[ ! -f $is_config_json || ! -d $is_conf_dir ]] && return 0
+    local out
+    if out=$($is_core_bin check -c "$is_config_json" -C "$is_conf_dir" 2>&1); then
+        return 0
+    fi
+    msg "$out"
+    return 1
+}
+
+# 诊断: 找出 conf 目录里重复的监听端口.
+# 两个配置文件用同一个端口时会生成同名 outbound 标签 direct_<port>, 合并配置直接非法
+# (duplicate outbound/endpoint tag), 核心起不来 -> 所有节点一起失效. 这里把冲突文件打出来.
+conflict_ports() {
+    local f p
+    for f in "$is_conf_dir"/*.json; do
+        [[ -f $f ]] || continue
+        [[ $f == *route.json ]] && continue
+        p=$(jq -r '.inbounds[0].listen_port // empty' "$f" 2>/dev/null)
+        [[ $p ]] && printf '%s %s\n' "$p" "${f##*/}"
+    done | sort -n | awk '{ c[$1] = c[$1] " " $2; n[$1]++ } END { for (p in c) if (n[p] > 1) print "  - 端口 " p " 同时被以下配置使用:" c[p] }'
+}
+
+# 写入前的预检: 把「现有 conf + 待写入的新节点」放到临时目录, 用 sing-box check 校验合并结果.
+# 不通过就直接放弃本次创建, 这样新节点永远不会把正在运行的核心带崩.
+# $3 = 会被本次操作替换掉的旧配置文件名 (修改/改协议时它还没删, 预检里必须排除, 否则会误报重复端口).
+# 主配置(config.json)尚不存在时(安装流程创建首个节点)跳过, 由创建完 config.json 后的 check_core_config 兜底.
+check_new_node() {
+    local json=$1 name=$2 skip_old=${3:-} tmp f out
+    [[ ! -f $is_config_json || ! -d $is_conf_dir ]] && return 0
+    tmp=$(mktemp -d 2>/dev/null) || tmp=${TMPDIR:-/tmp}/$is_core-check-$$
+    mkdir -p "$tmp" || return 0
+    for f in "$is_conf_dir"/*.json; do
+        [[ -f $f ]] || continue
+        [[ $f == *route.json ]] && continue
+        # 同名旧文件/被替换的旧配置都会由新配置取代, 不要带进预检
+        [[ ${f##*/} == "$name" ]] && continue
+        [[ $skip_old && ${f##*/} == "$skip_old" ]] && continue
+        cp -f "$f" "$tmp/" 2>/dev/null
+    done
+    printf '%s\n' "$json" >"$tmp/$name"
+    if ! out=$($is_core_bin check -c "$is_config_json" -C "$tmp" 2>&1); then
+        msg "$out"
+        conflict_ports
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    return 0
 }
 
 show_list() {
@@ -745,6 +834,8 @@ create() {
             --arg tls_cer "$is_tls_cer" \
             --arg bind_ip "$is_bind_ip" \
             "{inbounds:[{tag:\$tag,type:\"$is_protocol\",$is_listen,listen_port:$port,$json_str}]$is_add_public_key}" <<<{})
+        # jq 出错时会得到空串; 空配置写进 conf 会让 core 起不来, 连带已有节点全部失效, 必须拦下
+        [[ ! $is_new_json ]] && err "生成配置失败 (jq 解析出错), 已取消本次操作."
         [[ $is_test_json ]] && return # tmp test
         # only show json, dont save to file.
         [[ $is_gen ]] && {
@@ -753,6 +844,15 @@ create() {
             msg
             return
         }
+        # 写入前预演合并结果: 新节点 + 现有 conf 必须能被 sing-box 正常解析/校验,
+        # 否则直接放弃, 不要让新节点把整个核心(所有节点)带崩
+        check_new_node "$is_new_json" "$is_config_name" "$is_config_file" || err "新配置未通过 sing-box 校验, 已取消创建 (现有节点不受影响)."
+        # 备份将被替换的旧配置: 最终校验不通过时原样恢复, 不能因为改配置把老节点弄丢
+        is_old_json_backup=
+        if [[ $is_config_file && -f $is_conf_dir/$is_config_file ]]; then
+            is_old_json_backup=$(mktemp 2>/dev/null) || is_old_json_backup=${TMPDIR:-/tmp}/$is_core-old-$$
+            cp -f "$is_conf_dir/$is_config_file" "$is_old_json_backup" 2>/dev/null || is_old_json_backup=
+        fi
         # del old file
         [[ $is_config_file ]] && is_no_del_msg=1 && del $is_config_file
         # save json to file
@@ -762,6 +862,18 @@ create() {
             create config.json
         fi
         build_route_json
+        # 最终整体校验: 合并后的配置不可用时不重启核心, 并回滚刚写入的节点.
+        # 这样即使新节点有问题, 旧节点仍在原进程里继续工作.
+        if [[ -f $is_config_json ]] && ! check_core_config; then
+            rm -f "$is_json_file"
+            if [[ $is_old_json_backup ]]; then
+                cp -f "$is_old_json_backup" "$is_conf_dir/$is_config_file"
+                rm -f "$is_old_json_backup"
+            fi
+            build_route_json
+            err "合并后的配置未通过 sing-box 校验, 已回滚新节点且未重启核心 (现有节点不受影响)."
+        fi
+        [[ $is_old_json_backup ]] && rm -f "$is_old_json_backup"
         # caddy auto tls
         [[ $is_caddy && $host && ! $is_no_auto_tls ]] && {
             create caddy $net
@@ -1600,9 +1712,9 @@ get() {
         *reality*)
             net=reality
             [[ ! $is_servername ]] && is_servername=$is_random_servername
-            if [[ ! $is_private_key ]]; then
-                get_pbk
-                [[ $is_private_key && $is_public_key ]] || {
+            # 密钥缺失或形态不合法(旧配置写入的垃圾值)时重新生成; 生成失败直接中止, 绝不写出无效节点
+            if [[ ! $is_private_key ]] || ! _is_reality_key "$is_private_key" || ! _is_reality_key "$is_public_key"; then
+                get_pbk || {
                     msg "可手动执行确认: $is_core_bin generate reality-keypair"
                     err "Reality 密钥生成失败, 无法创建节点."
                 }
@@ -1891,6 +2003,14 @@ update() {
 is_main_menu() {
     msg "\n------------- $is_core_name script $is_sh_ver -------------"
     msg "$is_core_name $is_core_ver: $is_core_status"
+    # 启动自检: 合并后的配置不合法时明确提示 (否则 core 一重启所有节点就一起失效, 很难定位)
+    if [[ -f $is_config_json && -d $is_conf_dir ]]; then
+        check_core_config >/dev/null 2>&1 || {
+            warn "当前配置未通过 sing-box 校验, 核心重启后会启动失败 (所有节点都会失效)."
+            conflict_ports
+            msg "可执行以下命令查看具体报错: $(_yellow "$is_core_bin check -c $is_config_json -C $is_conf_dir")\n"
+        }
+    fi
     is_main_start=1
     ask_menu is_main_pick main_pick "" "" exit "${mainmenu[@]}" # 空输入退出
     case $main_pick in
