@@ -2011,6 +2011,13 @@ update() {
             msg "\n$is_show_name 当前已经是最新版本了.\n"
             exit
         }
+        # 只升不降: 本地版本比远端 release 新时(例如本地已打补丁并把 is_sh_ver 提到 v1.19,
+        # 而仓库里还是 v1.18)不能"更新", 否则会把本地修复覆盖回旧代码.
+        if [[ $(printf '%s\n%s\n' "${is_run_ver#v}" "${latest_ver#v}" | sort -V | tail -n1) == "${is_run_ver#v}" ]]; then
+            msg "\n本地 $is_show_name 版本 ($is_run_ver) 比远端 ($latest_ver) 新, 已跳过更新.\n"
+            msg "如需强制使用远端版本, 请用: $(_green "$is_core update $is_update_name $latest_ver") (会覆盖本地修改)\n"
+            exit
+        fi
         msg "\n发现 $is_show_name 新版本: $(_green $latest_ver)\n"
         is_new_ver=$latest_ver
     fi
