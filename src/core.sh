@@ -402,11 +402,13 @@ load_config_vars() {
         p("is_servername";  $i.tls.server_name),
         p("is_private_key"; $i.tls.reality.private_key),
         # 公钥存在假 outbound 的 tag 里: 新格式 public_key_<port>:<key>, 旧格式 public_key_<key>
-        p("is_public_key";  (([.outbounds[].tag | select(startswith("public_key_"))][0] // "") | sub("^public_key_[0-9]+:"; "") | sub("^public_key_"; ""))),
-        p("is_listen_disp"; (([.outbounds[].tag | select(startswith("nat_in_"))][0] // "") | .[7:] | sub("^[0-9]+_"; ""))),
-        p("is_bind_disp";   (([.outbounds[].tag | select(startswith("nat_out_"))][0] // "") | .[8:] | sub("^[0-9]+_"; ""))),
-        p("is_bind4";       .outbounds[0].inet4_bind_address),
-        p("is_bind6";       .outbounds[0].inet6_bind_address)
+        # 注意: 非 reality 节点(如 Hysteria2)的配置里根本没有 outbounds,
+        # 必须用 .outbounds[]? 可选迭代, 否则 jq 会报 "Cannot iterate over null" -> 整个文件读不出来.
+        p("is_public_key";  (([.outbounds[]?.tag | select(startswith("public_key_"))][0] // "") | sub("^public_key_[0-9]+:"; "") | sub("^public_key_"; ""))),
+        p("is_listen_disp"; (([.outbounds[]?.tag | select(startswith("nat_in_"))][0] // "") | .[7:] | sub("^[0-9]+_"; ""))),
+        p("is_bind_disp";   (([.outbounds[]?.tag | select(startswith("nat_out_"))][0] // "") | .[8:] | sub("^[0-9]+_"; ""))),
+        p("is_bind4";       (.outbounds[0].inet4_bind_address? // empty)),
+        p("is_bind6";       (.outbounds[0].inet6_bind_address? // empty))
     ' "$f" 2>/dev/null) || err "无法读取此文件: $1"
     while IFS='=' read -r k v; do
         [[ $v == null || -z $v ]] && continue
